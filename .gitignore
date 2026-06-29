@@ -5,4 +5,7 @@ __pycache__/
 .env
 .DS_Store
 _pdf_text_dump.json
-out/
+# Ignore generated outputs, but keep one committed sample extraction so the repo
+# is inspectable without running the pipeline.
+out/*
+!out/extraction.json

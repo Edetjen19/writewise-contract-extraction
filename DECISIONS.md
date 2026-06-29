@@ -33,8 +33,8 @@ SHA-256; a re-run replaces that document's child rows in one transaction).
 ## Extraction and trustworthiness
 
 Provider is **OpenAI** (the assessment key; default `gpt-4.1-mini`, `OPENAI_MODEL`-configurable),
-isolated to `extract.py` + `agent.py`. Trust comes from a three-way gate over deterministic
-pdfplumber text:
+isolated to `extract.py` + `agent.py`. Trust comes from a gate over deterministic pdfplumber
+text. Three hard checks abort the load on failure, plus one advisory:
 
 - **Structured outputs** (`chat.completions.parse`) force schema-valid JSON, in focused
   per-section calls so the model never juggles the whole doc and drops a section.
@@ -47,6 +47,10 @@ pdfplumber text:
   **re-extracts up to 3×** (LLM nondeterminism usually clears it) and aborts otherwise; the
   loader dedupes as a backstop. This caught two real `gpt-4.1-mini` slips: a duplicated cell
   and a dropped fee.
+- **Page attribution (advisory):** each `raw_text` should also appear on the *page* the row
+  cites; a value grounded elsewhere in the corpus but not on its cited page is surfaced for
+  review. This is the one check a bare-string grounding pass can't do, and it targets the
+  mis-attribution class below (it's clean on the current run).
 
 I extract from text, not page images — the text already contains every value verbatim, which
 keeps grounding tight (page-image vision is the fallback for a worse layout).
@@ -65,10 +69,10 @@ grounding/safety this is graded on.
 ## Grounding and ambiguity
 
 Grounding is defense-in-depth: (1) the agent has **no access to the PDF or model memory** for
-facts — the only path to a number is a tool, so an off-data figure is unreachable; (2) the
-system prompt forbids any figure not returned by a tool, requires unit + context on every
-answer, and says "not specified" when tools return nothing; (3) results carry `raw_text` +
-`page`. For ambiguity ("What's the brand discount?"), tools return all matches when a filter is
+facts; the only path to a number is a tool, so there is no data path for the model to invent
+one (the figure has to come from a row); (2) the system prompt forbids any figure not returned
+by a tool, requires unit + context on every answer, and says "not specified" when tools return
+nothing; (3) results carry `raw_text` + `page`. For ambiguity ("What's the brand discount?"), tools return all matches when a filter is
 omitted, the prompt instructs present-or-clarify, and the available dimensions are injected from
 the DB so the agent disambiguates concretely — surfacing both pricing bases and both rebate
 timings rather than guessing.
@@ -86,14 +90,21 @@ none), and psycopg disables prepared statements so it works through any Supabase
 
 - The jumbled fee schedule (pages 7-8) puts a row label *between* a price and its descriptor;
   the model sometimes stitched `raw_text` across the gap (caught by grounding) or dropped a line
-  (caught by coverage). Fix: `raw_text` = a single-line verbatim token, descriptors → `qualifier`,
-  plus the gate + retry. A nastier layout would warrant page-image vision.
+  (caught by coverage). Worse, where a *price precedes its label* (the "...support — late fee",
+  priced `$235 per hour`), it once landed on the row above and the fee was mislabeled `Included`
+  on the wrong page, grounded only because "Included" recurs. Fix: `raw_text` = a single-line
+  verbatim token, descriptors → `qualifier`, an explicit "a priced service is never `Included`"
+  rule that attributes the price to the labeled row, plus the page-attribution advisory. Residual:
+  an *included* base allotment that physically precedes its portal-access label can still attach
+  to the adjacent service (all values are preserved; only the grouping is imperfect). A nastier
+  layout would warrant page-image vision.
 - `gpt-4.1-mini` occasionally duplicated a `network_pricing` cell → `check_structure` gates it.
 - Agent search was whole-phrase `ILIKE` and once called a present fee "not specified"; now
   per-word AND, and the agent broadens a failed search first.
 - `estimate_rebate_total` assumes one rebatable brand drug per claim (surfaced in its output).
-- Coverage only catches a dropped row when its value is unique; a non-priced "Included" drop
-  isn't flagged — a golden-file reconciliation would close this.
+- Coverage only catches a dropped row when its value is unique. The page-attribution advisory now
+  flags a value cited to the *wrong page*, but a bare "Included" mis-grouped on the *same* page
+  still slips by; a golden-file reconciliation would close this.
 - Single-document agent (latest, or `--vendor`); no multi-document comparison.
 
 ## With more time

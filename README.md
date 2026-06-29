@@ -198,18 +198,24 @@ python eval/run_eval.py
 ```
 
 `pipeline run` verifies every extraction and, by default, **refuses to load** unless it
-passes three checks: **grounding** (each value traces to verbatim PDF text), **coverage**
+passes three hard checks: **grounding** (each value traces to verbatim PDF text), **coverage**
 (every priced token captured, no silent drops), and **structure** (no duplicate or missing
-grid cells). LLM extraction is nondeterministic, so the pipeline **self-heals** by
-re-extracting up to 3x before giving up. Override the gate with `--allow-ungrounded`; use
-`--no-load` to verify without a database (handy for inspecting `out/extraction.json`).
+grid cells); it also emits an advisory **page-attribution** signal (a value grounded in the
+corpus but not on its cited page). LLM extraction is nondeterministic, so the pipeline
+**self-heals** by re-extracting up to 3x before giving up. Override the gate with
+`--allow-ungrounded`; use `--no-load` to verify without a database. A sample
+`out/extraction.json` (the validated rows + the verification report) is committed so you can
+inspect the structured output without running the pipeline; it is regenerated on each run.
 
-### Reproducible across vendors
+### Reproducible across same-format proposals
 
-The pipeline takes the PDF as input and is not hardcoded to Northwind's numbers
-or name; running it on a second proposal in the same format adds a second
-`documents` row. The controlled vocabulary (network/component/category/unit) lives
-in `models.py`, so a new variant is a one-file change, not a schema migration.
+The pipeline takes the PDF as input and is not hardcoded to Northwind's numbers or
+name: values are extracted from the text and the year grid is inferred from the data,
+so a second proposal **in the same layout** with a different vendor and different
+numbers loads as a second `documents` row. The format itself (the column-to-network
+mapping, the section names) is encoded in the extraction prompts plus the controlled
+vocabulary in `models.py`, so a genuinely different layout is a prompt + vocabulary
+change, not a schema migration.
 
 ---
 
@@ -237,7 +243,7 @@ schema.sql        the database schema (graded artifact; heavily commented)
 config.py         loads .env
 pdf_text.py       deterministic PDF text extraction + normalization (provenance + grounding corpus)
 models.py         Pydantic extraction schema + controlled vocabulary
-extract.py        Claude structured extraction, section by section
+extract.py        OpenAI structured extraction, section by section
 verify.py         grounding (precision) + coverage (recall) checks
 load.py           idempotent load into Postgres
 pipeline.py       CLI: init-db / run
