@@ -1,0 +1,36 @@
+# Eval Q&A pairs for the Northwind sample. Each answer is graded by checking that
+# the correct, grounded values appear in the agent's response (comma-insensitive).
+#   expect_all : every string must appear
+#   expect_any : at least one must appear
+- id: generic_retail90_2026
+  question: "What's the generic discount for Retail 90 in 2026?"
+  expect_all: ["89.10"]
+  expect_any: ["AWP"]
+  note: "Same under both pricing bases (generic discounts don't change)."
+
+- id: clinical_pa_physician
+  question: "How much is a clinical prior authorization with physician review?"
+  expect_all: ["95"]
+  note: "$95 each (vs $65 for a standard clinical PA)."
+
+- id: specialty_rebate_2027_timing
+  question: "What's the specialty rebate per brand drug in 2027, and when is it paid?"
+  expect_all: ["6,115", "5,850"]
+  expect_any: ["150 days", "60 days", "quarter", "month"]
+  note: "Two schedules: $6,115.00 quarterly (150d after quarter) vs $5,850.00 monthly (60d after month)."
+
+- id: eligibility_included_vs_cost
+  question: "What's included vs extra-cost in eligibility maintenance?"
+  expect_all: ["6.00", "12.00"]
+  expect_any: ["Included", "included"]
+  note: "Electronic = Included; manual member/physician $6.00/record; manual group/division $12.00/record."
+
+- id: rebate_estimate_compute
+  question: "For 10,000 Retail 30 brand claims in 2026 under the quarterly-payment schedule, estimate total rebate dollars."
+  expect_all: ["405.25", "4,052,500"]
+  note: "$405.25 per brand drug x 10,000 = $4,052,500 (one brand drug per claim assumed)."
+
+- id: ambiguous_brand_discount
+  question: "What's the brand discount?"
+  expect_any: ["which", "traditional", "applied", "retail 90", "retail 30", "specify"]
+  note: "Under-specified (network/year/basis). Agent should disambiguate, not guess one number."
