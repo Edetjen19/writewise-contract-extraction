@@ -1,0 +1,6 @@
+openai>=1.50
+pdfplumber>=0.11
+psycopg[binary]>=3.2
+pydantic>=2.7
+python-dotenv>=1.0
+PyYAML>=6.0
