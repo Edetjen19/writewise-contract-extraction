@@ -1,114 +1,51 @@
 # Decisions
 
-## Schema design
+A few notes on the choices that mattered and the parts that didn't go cleanly.
 
-**One row per atomic, queryable fact.** The PDF stacks three years in one cell
-(`2025: AWP-21.50% / 2026: … / 2027: …`); I explode these to one row per `(…, year)`
-so a question about 2026 is a `WHERE year = 2026`, not blob-parsing. The dimensions the
-document makes easy to lose are first-class columns:
+## Schema
 
-- **`pricing_basis`** (`traditional` vs `applied_rebates`) keeps the two near-identical
-  sections distinct. They differ only in brand discounts (rebates baked in), so each basis
-  is stored as a full set, not merged.
-- **Rebate payment timing** (`payment_frequency`, `payment_lag_days`, `payment_timing_text`):
-  the two rebate tables differ *only* by timing, so it is first-class; merging would erase a
-  real offer.
-- **Units are never implied** — `network_pricing.rate_type`/`unit` and `fee_schedule.unit`
-  carry the mixed bag ($/claim, PMPM, PMPY, $/record, $/audit, $/year, …).
-- **Non-numeric values** use `fee_schedule.value_kind`
-  (`included`/`quoted_on_request`/`pass_through`/`conditional`) with `value` NULL, so
-  "Included" and "$65 each" coexist honestly.
-- **One service, many prices** (Appeals; "4 users included / $450 each additional") →
-  multiple rows via `variant`.
+The whole design follows from one decision: one row per fact, not one row per table cell. The PDF crams three years into a single cell ("2025: AWP-21.50% / 2026: ... / 2027: ..."), so I split that into a row per year. Asking for the 2026 number is then a `where year = 2026` instead of parsing a string.
 
-`year` is a plain `int`, so the admin-fee table (2024-2026) coexists with the discount
-tables (2025-2027) with no special case; admin fees are a separate table because they are
-program-wide, not network-scoped. Every row stores verbatim `raw_text` + `page`, and
-`document_pages` holds full page text, so nothing is unprovenanced. Controlled vocabularies
-are **TEXT validated in the app**, not Postgres ENUMs: a new vendor's network name then loads
-without a migration; only the invariant axes (`pricing_basis`, `rate_type`,
-`payment_frequency`, `value_kind`) carry DB `CHECK`s. Loading is idempotent (unique on file
-SHA-256; a re-run replaces that document's child rows in one transaction).
+After that it was about not losing the things that are easy to lose:
 
-## Extraction and trustworthiness
+- The two pricing sections, "traditional" and "applied rebates", look almost identical, but the brand discounts differ a lot because applied-rebates folds the rebate into the discount. I keep them as two full sets under a `pricing_basis` column rather than merging, which would quietly throw away real pricing.
+- The two rebate tables are identical except for when they pay out, so the payment timing (frequency, lag in days, and the literal sentence) is its own columns. Drop it and you've collapsed two different offers into one.
+- Units are never implied. Every priced row has an explicit unit, which matters because the fee schedule is all over the place: per claim, PMPM, PMPY, per record, per audit, flat annual.
+- Non-numeric "values" like "Included" go in a `value_kind` column with a null amount, so a price and a non-price share a table without me inventing a number.
+- A few services have several prices (the four appeal types), so those become multiple rows with a `variant`.
 
-Provider is **OpenAI** (the assessment key; default `gpt-4.1-mini`, `OPENAI_MODEL`-configurable),
-isolated to `extract.py` + `agent.py`. Trust comes from a gate over deterministic pdfplumber
-text. Three hard checks abort the load on failure, plus one advisory:
+Two smaller calls. `year` is just an integer, which is why the admin-fee table (2024-2026) sits next to the discount tables (2025-2027) with no special-casing. And every row keeps its exact source text and page, with the full page text stored separately, so nothing is untraceable to the PDF.
 
-- **Structured outputs** (`chat.completions.parse`) force schema-valid JSON, in focused
-  per-section calls so the model never juggles the whole doc and drops a section.
-- **Grounding (precision):** every `raw_text` must appear verbatim in the PDF text; the model
-  is told this, so it copies rather than paraphrases.
-- **Coverage (recall):** every priced token (`$…`, `AWP-…%`) must land in some row, catching
-  silent drops.
-- **Structure:** `check_structure` flags duplicate keys and grid holes (a
-  `(basis, network, component)` missing a year its siblings have). On any failure the pipeline
-  **re-extracts up to 3×** (LLM nondeterminism usually clears it) and aborts otherwise; the
-  loader dedupes as a backstop. This caught two real `gpt-4.1-mini` slips: a duplicated cell
-  and a dropped fee.
-- **Page attribution (advisory):** each `raw_text` should also appear on the *page* the row
-  cites; a value grounded elsewhere in the corpus but not on its cited page is surfaced for
-  review. This is the one check a bare-string grounding pass can't do, and it targets the
-  mis-attribution class below (it's clean on the current run).
+I went back and forth on Postgres enums for the controlled fields and decided against them. The vocabularies (networks, components, units) are validated in Python, and only the genuinely fixed axes get DB CHECKs. The point is the second-document requirement: a different vendor with a slightly different network name should load without a migration. Reloads are idempotent on the file's hash.
 
-I extract from text, not page images — the text already contains every value verbatim, which
-keeps grounding tight (page-image vision is the fallback for a worse layout).
+## Extraction, and trusting the output
 
-## Tool design: typed tools, not one SQL tool
+I use the model to read the messy tables, but I treat its output as a draft that has to earn its way in. Everything is checked against the deterministic pdfplumber text, which I trust because no model touched it. Extraction is split into focused per-section calls with structured outputs, so the JSON shape can't drift and the model isn't juggling the whole document at once (which is how sections get dropped).
 
-I chose several typed, read-only tools (`get_network_pricing`, `get_rebate_guarantee`,
-`search_fee_schedule`, `estimate_rebate_total`, …) over a generic query tool because: the
-model can't emit arbitrary SQL or hallucinate a column (constrained, auditable); each tool is
-a question shape whose typed filters make ambiguity explicit (omit a filter → broaden, don't
-guess); and every row returned carries `raw_text` + `page`. Trade-off: less flexible for novel
-cross-table queries and more design upfront, mitigated by keyword-search tools and a
-`get_document_overview`. A raw-SQL tool would be more flexible but sacrifices exactly the
-grounding/safety this is graded on.
+Then three checks, any of which aborts the load. Grounding: every value's source string must appear verbatim in the PDF, so the model copies instead of paraphrasing. Coverage: every dollar amount and AWP discount in the source has to land in some row, catching the opposite failure, silent drops. Structure: no duplicate keys and no grid holes (a network/component missing a year its siblings have). On failure it re-extracts up to three times, since a fresh pass usually clears a nondeterministic slip.
 
-## Grounding and ambiguity
+There's a fourth, advisory check: whether each value actually shows up on the page it cites. It doesn't block the load, but it's the one thing plain grounding can't catch, and it targets the mis-attribution bug below. I pull from text, not page images, on purpose. The text has every value exactly, which is what keeps grounding strict. Vision would be the fallback for a layout text couldn't handle.
 
-Grounding is defense-in-depth: (1) the agent has **no access to the PDF or model memory** for
-facts; the only path to a number is a tool, so there is no data path for the model to invent
-one (the figure has to come from a row); (2) the system prompt forbids any figure not returned
-by a tool, requires unit + context on every answer, and says "not specified" when tools return
-nothing; (3) results carry `raw_text` + `page`. For ambiguity ("What's the brand discount?"), tools return all matches when a filter is
-omitted, the prompt instructs present-or-clarify, and the available dimensions are injected from
-the DB so the agent disambiguates concretely — surfacing both pricing bases and both rebate
-timings rather than guessing.
+## Tools for the agent
 
-## Security (Supabase)
+I gave the agent a handful of typed, read-only tools (get_network_pricing, get_rebate_guarantee, search_fee_schedule, estimate_rebate_total, ...) instead of one "run any SQL" tool. The model can't write arbitrary queries or name a column that doesn't exist, every call is auditable, and typed filters make ambiguity explicit: leave a filter off and you get all matches, not a guess. The cost is flexibility, since a generic SQL tool would handle stranger questions, but that's the trade I wanted, because grounding and safety are the point. Keyword-search tools and a get_document_overview cover the long tail.
 
-Backend-only datastore: the pipeline/agent use the direct Postgres connection (the `postgres`
-role bypasses RLS); nothing uses the anon/PostgREST path. So `schema.sql` enables RLS with no
-policies — public anon/authenticated roles are denied by default (a leaked anon key can't touch
-pricing data), our connection is unaffected, and it is a no-op on local Postgres. Extensions are
-kept out of `public` (I dropped the optional `pg_trgm` index; ILIKE over tens of rows needs
-none), and psycopg disables prepared statements so it works through any Supabase pooler mode.
+## Keeping the agent honest, and vague questions
 
-## What broke / limitations
+The grounding guarantee is mostly structural: the agent has no access to the PDF and no memory of the contract, so the only way it gets a number is to call a tool and read it off a row. The prompt reinforces it, never state a figure a tool didn't return, always give the unit and context, say "not specified" when nothing comes back. Every row carries source text and page.
 
-- The jumbled fee schedule (pages 7-8) puts a row label *between* a price and its descriptor;
-  the model sometimes stitched `raw_text` across the gap (caught by grounding) or dropped a line
-  (caught by coverage). Worse, where a *price precedes its label* (the "...support — late fee",
-  priced `$235 per hour`), it once landed on the row above and the fee was mislabeled `Included`
-  on the wrong page, grounded only because "Included" recurs. Fix: `raw_text` = a single-line
-  verbatim token, descriptors → `qualifier`, an explicit "a priced service is never `Included`"
-  rule that attributes the price to the labeled row, plus the page-attribution advisory. Residual:
-  an *included* base allotment that physically precedes its portal-access label can still attach
-  to the adjacent service (all values are preserved; only the grouping is imperfect). A nastier
-  layout would warrant page-image vision.
-- `gpt-4.1-mini` occasionally duplicated a `network_pricing` cell → `check_structure` gates it.
-- Agent search was whole-phrase `ILIKE` and once called a present fee "not specified"; now
-  per-word AND, and the agent broadens a failed search first.
-- `estimate_rebate_total` assumes one rebatable brand drug per claim (surfaced in its output).
-- Coverage only catches a dropped row when its value is unique. The page-attribution advisory now
-  flags a value cited to the *wrong page*, but a bare "Included" mis-grouped on the *same* page
-  still slips by; a golden-file reconciliation would close this.
-- Single-document agent (latest, or `--vendor`); no multi-document comparison.
+For a vague question like "what's the brand discount?", the tools return everything matching when a filter is omitted, and the agent lays out the options or asks rather than picking one. I also feed it the available networks, years, and bases, so it disambiguates with the real options (both pricing bases, both rebate schedules) instead of guessing.
 
-## With more time
+## Security
 
-Prompt-cache the corpus and parallelize section calls; a `show_source(page)` tool; `strict: true`
-tool schemas + per-row confidence; golden-file reconciliation and a larger eval set; SQL views for
-common lookups.
+Backend-only datastore, so I treated it like one. The pipeline and agent use the direct Postgres connection, which bypasses row-level security, and nothing uses Supabase's anon/PostgREST path. So the schema turns RLS on with no policies: the public anon and authenticated roles are denied by default (a leaked anon key can't read or change pricing), my connection is unaffected, and it's a no-op on plain Postgres. I also kept extensions out of the public schema (dropped pg_trgm, since ILIKE over a few dozen rows needs no index), and psycopg runs with prepared statements off so it works through any Supabase pooler mode.
+
+## What broke
+
+The fee schedule on pages 7 and 8 was the real fight. The layout is jumbled enough that a price can sit on a different line from its label. When the price was buried in a row's wrapped text, the model sometimes stitched it into the wrong row (grounding caught it) or dropped a line (coverage caught it). The nastier case was a price sitting above its label, the "support late fee" that's actually $235 an hour. It once attached to the row above and got labeled "Included" on the wrong page, and it passed every check because "Included" genuinely appears elsewhere, so the string was technically grounded. That's the one I'm least happy slipped through. It's why I added the page-attribution check and a flat rule that a priced service is never "Included" and the price belongs to its own labeled row. One rough edge remains: an "included" base allotment that physically precedes its label can still attach to the neighboring service. No values are lost, the grouping is just slightly off, and I'd rather note that than re-roll a nondeterministic extraction and risk re-breaking the late-fee fix.
+
+Smaller things. The model occasionally duplicated a network-pricing cell, which the structure check catches. The agent's keyword search matched the whole phrase and once said a fee wasn't there when it was, so it's per-word now. The rebate estimate assumes one rebatable brand drug per claim, and says so. And coverage only catches a dropped value if that value is unique, so a plain "Included" mis-grouped on the same page would still get past me, which a golden-file check would close.
+
+## What I'd do with more time
+
+Prompt-cache the document so re-runs are cheaper, run the section extractions in parallel, add a show_source tool that returns the page text behind an answer, turn on strict tool schemas with per-row confidence, build the golden-file reconciliation and a bigger eval set, and add a couple of SQL views for common lookups.
