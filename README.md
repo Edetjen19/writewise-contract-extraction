@@ -21,6 +21,119 @@ and trade-offs.
 
 ---
 
+## Architecture
+
+The extraction pipeline (PDF to database) and the Q&A agent (question to grounded answer).
+Nothing loads unless it passes the verification gate, and the agent can only reach the
+database through typed, read-only tools.
+
+```mermaid
+flowchart TB
+  PDF["Pricing proposal PDF"]
+
+  subgraph PIPE["Extraction pipeline (pipeline.py)"]
+    direction TB
+    TXT["pdf_text.py: pdfplumber reads page text (no AI)"]
+    EXT["extract.py: OpenAI gpt-4.1-mini, structured outputs into typed rows"]
+    VER{"verify.py gate: grounding + coverage + structure"}
+    LOAD["load.py: idempotent load"]
+    TXT --> EXT --> VER
+    VER -->|"fail: retry up to 3x"| EXT
+    VER -->|"pass"| LOAD
+  end
+
+  subgraph DB["Supabase (PostgreSQL, RLS on)"]
+    direction TB
+    TBLS["8 tables: documents, document_pages, network_pricing,<br/>administrative_fees, rebate_guarantees, fee_schedule,<br/>included_services, assumptions"]
+  end
+
+  subgraph AGENT["Q&A agent (chat.py + agent.py)"]
+    direction TB
+    USER["User question"]
+    LLM["GroundedAgent: OpenAI gpt-4.1-mini"]
+    TOOLS["tools.py: typed, read-only DB tools"]
+    ANS["Grounded answer: value + unit + source page"]
+    USER --> LLM
+    LLM -->|"tool call with filters"| TOOLS
+    TOOLS -->|"rows + raw_text + page"| LLM
+    LLM --> ANS
+  end
+
+  PDF --> TXT
+  LOAD --> TBLS
+  TOOLS <-->|"safe SQL only"| TBLS
+```
+
+### Database schema
+
+Everything links to one `documents` row. The core idea is **one row per atomic fact** (one
+pricing basis, network, component, year), and every row keeps the verbatim source text and page.
+
+```mermaid
+erDiagram
+  documents ||--o{ document_pages : "1 per page"
+  documents ||--o{ network_pricing : "discount/fee rows"
+  documents ||--o{ administrative_fees : "per-year fee"
+  documents ||--o{ rebate_guarantees : "rebate rows"
+  documents ||--o{ fee_schedule : "fee lines"
+  documents ||--o{ included_services : "bundled services"
+  documents ||--o{ assumptions : "caveats"
+
+  documents {
+    uuid id PK
+    text vendor_name
+    text client_name
+    date proposal_date
+    text source_sha256
+  }
+  network_pricing {
+    text pricing_basis "traditional or applied_rebates"
+    text network "retail_30, mail, etc"
+    text component "brand_discount, etc"
+    int year
+    numeric value
+    text unit
+    text raw_text "verbatim source"
+    int page
+  }
+  rebate_guarantees {
+    text payment_frequency "quarterly or monthly"
+    int payment_lag_days "150 or 60"
+    text network
+    int year
+    numeric amount
+    text raw_text
+  }
+  fee_schedule {
+    text service_name
+    text variant "for multi-price rows"
+    text value_kind "numeric, included, quoted, pass_through"
+    numeric value
+    text unit "usd_per_claim, pmpm, etc"
+    text raw_text
+  }
+  administrative_fees {
+    text pricing_basis
+    int year "2024-2026"
+    numeric value
+    text raw_text
+  }
+  document_pages {
+    int page
+    text text "full page text"
+  }
+  included_services {
+    text category
+    text description
+  }
+  assumptions {
+    text section
+    text text
+  }
+```
+
+---
+
 ## Prerequisites
 
 - Python 3.11+ (developed on 3.13)
