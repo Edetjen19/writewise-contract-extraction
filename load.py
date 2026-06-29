@@ -62,7 +62,7 @@ def load(
     np_rows = _dedupe(result.network_pricing, lambda r: (r.pricing_basis, r.network, r.component, r.year))
     af_rows = _dedupe(result.administrative_fees, lambda r: (r.pricing_basis, r.year))
     rb_rows = _dedupe(result.rebates, lambda r: (r.payment_frequency, r.network, r.year))
-    fee_rows = _dedupe(result.fees, lambda r: (r.service_name, r.variant))
+    fee_rows = _dedupe(result.fees, lambda r: (r.category, r.service_name, r.variant))
     inc_rows = _dedupe(result.included_services, lambda r: (r.category, r.description))
     asm_rows = _dedupe(result.assumptions, lambda r: (r.section, r.text))
     with conn.cursor() as cur:

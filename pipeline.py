@@ -46,6 +46,7 @@ def _result_to_dict(result: ExtractionResult, report: GroundingReport) -> dict:
             "source_tokens": report.source_tokens,
             "captured_tokens": report.captured_tokens,
             "uncaptured_tokens": report.uncaptured_tokens,
+            "page_mismatches": [u.__dict__ for u in report.page_mismatches],
         },
     }
 

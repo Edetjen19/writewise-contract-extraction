@@ -1,16 +1,24 @@
 """Grounding verification: the gate that keeps LLM output trustworthy.
 
-Two complementary checks run against the deterministic pdfplumber text:
+Three checks run against the deterministic pdfplumber text. Precision and recall
+are hard gates: by default the pipeline self-heals (re-extracts) and then refuses
+to load if either fails (override with --allow-ungrounded). The page check is
+advisory.
 
   PRECISION (no hallucination): every extracted row's verbatim `raw_text`
     (or description/text for the prose tables) must appear in the source. A row
-    whose source string isn't found is flagged ungrounded. By default the
-    pipeline refuses to load if anything is ungrounded.
+    whose source string isn't found is flagged ungrounded -> load aborts.
 
   RECALL (no silent drops): every priced token in the source ($amounts and
-    AWP-discounts) should appear in some extracted row. Anything uncaptured is
-    surfaced for human review. Advisory, not a hard gate, because a few tokens
-    legitimately live only in prose.
+    AWP-discounts) must appear in some extracted row. An uncaptured priced token
+    means a value was dropped -> load aborts. (A second vendor may legitimately
+    keep a price only in prose; --allow-ungrounded is the escape hatch.)
+
+  PAGE ATTRIBUTION (advisory): each row's `raw_text` should also appear on the
+    PAGE the row cites. A row grounded somewhere in the corpus but NOT on its
+    cited page is surfaced (a likely mis-attribution). Advisory only, because a
+    short token like "Included" can legitimately recur across pages, so this is a
+    review signal, not a gate.
 """
 from __future__ import annotations
 
@@ -40,6 +48,7 @@ class GroundingReport:
     source_tokens: int = 0
     captured_tokens: int = 0
     uncaptured_tokens: list[str] = field(default_factory=list)
+    page_mismatches: list[Ungrounded] = field(default_factory=list)
 
     @property
     def all_grounded(self) -> bool:
@@ -57,44 +66,53 @@ class GroundingReport:
         if self.uncaptured_tokens:
             lines.append(f"  UNCAPTURED priced tokens ({len(self.uncaptured_tokens)}): "
                          + ", ".join(self.uncaptured_tokens[:25]))
+        if self.page_mismatches:
+            lines.append(f"  PAGE-ATTRIBUTION advisories ({len(self.page_mismatches)}; "
+                         f"grounded in corpus but not on the cited page):")
+            for u in self.page_mismatches[:25]:
+                lines.append(f"    [{u.table}] {u.identifier}: {u.snippet!r}")
         return "\n".join(lines)
 
 
 def _iter_snippets(result: ExtractionResult):
-    """Yield (table, identifier, snippet) for every row that should be grounded."""
+    """Yield (table, identifier, snippet, page) for every row that should be grounded."""
     for r in result.network_pricing:
-        yield "network_pricing", f"{r.pricing_basis}/{r.network}/{r.component}/{r.year}", r.raw_text
+        yield "network_pricing", f"{r.pricing_basis}/{r.network}/{r.component}/{r.year}", r.raw_text, r.page
     for r in result.administrative_fees:
-        yield "administrative_fees", f"{r.pricing_basis}/{r.year}", r.raw_text
+        yield "administrative_fees", f"{r.pricing_basis}/{r.year}", r.raw_text, r.page
     for r in result.rebates:
-        yield "rebate_guarantees", f"{r.payment_frequency}/{r.network}/{r.year}", r.raw_text
+        yield "rebate_guarantees", f"{r.payment_frequency}/{r.network}/{r.year}", r.raw_text, r.page
     for r in result.fees:
-        yield "fee_schedule", f"{r.service_name}/{r.variant or '-'}", r.raw_text
+        yield "fee_schedule", f"{r.service_name}/{r.variant or '-'}", r.raw_text, r.page
     for r in result.included_services:
-        yield "included_services", r.category, r.description
+        yield "included_services", r.category, r.description, r.page
     for r in result.assumptions:
-        yield "assumptions", r.section, r.text
+        yield "assumptions", r.section, r.text, r.page
 
 
 def verify(result: ExtractionResult, pages: list[Page]) -> GroundingReport:
     corpus_raw = "\n".join(clean_bullets(p.text) for p in pages)
     corpus = normalize(corpus_raw)
+    page_corpus = {p.page: normalize(clean_bullets(p.text)) for p in pages}
 
     report = GroundingReport()
 
-    # ---- precision ----
-    for table, ident, snippet in _iter_snippets(result):
+    # ---- precision (+ advisory page-attribution) ----
+    for table, ident, snippet, page in _iter_snippets(result):
         report.checked += 1
         snip = normalize(snippet)
         if snip and snip in corpus:
             report.grounded += 1
+            # Advisory: grounded somewhere, but is it on the page the row cites?
+            if snip not in page_corpus.get(page, ""):
+                report.page_mismatches.append(Ungrounded(table, f"{ident} (cited p{page})", snippet))
         else:
             report.ungrounded.append(Ungrounded(table, ident, snippet))
 
     # ---- recall ----
     tokens = set(_PRICE_RE.findall(corpus_raw)) | set(_AWP_RE.findall(corpus_raw))
     captured_blob = normalize(" ".join(
-        s for _, _, s in _iter_snippets(result)
+        s for _, _, s, _ in _iter_snippets(result)
     ))
     report.source_tokens = len(tokens)
     for tok in sorted(tokens):
@@ -137,7 +155,7 @@ def check_structure(result: ExtractionResult) -> list[str]:
     find_dups("rebate_guarantees", result.rebates,
               lambda r: (r.payment_frequency, r.network, r.year))
     find_dups("fee_schedule", result.fees,
-              lambda r: (r.service_name, r.variant))
+              lambda r: (r.category, r.service_name, r.variant))
 
     # network_pricing grid: each (basis, network, component) should cover all
     # years seen for that basis.

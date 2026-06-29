@@ -174,9 +174,13 @@ create table if not exists fee_schedule (
         check (value_kind in ('numeric', 'included', 'quoted_on_request',
                               'pass_through', 'conditional'))
 );
--- coalesce(variant,'') so (service, NULL-variant) is unique and reloads upsert cleanly
+-- Uniqueness includes category so two same-named services in DIFFERENT categories
+-- (possible in another vendor's schedule) don't collide and abort the load.
+-- coalesce(variant,'') so a NULL-variant row is unique and reloads cleanly. The
+-- drop keeps the definition current if an earlier version created a narrower key.
+drop index if exists fee_schedule_uq;
 create unique index if not exists fee_schedule_uq
-    on fee_schedule (document_id, service_name, coalesce(variant, ''));
+    on fee_schedule (document_id, category, service_name, coalesce(variant, ''));
 create index if not exists fee_schedule_category_idx
     on fee_schedule (document_id, category);
 
